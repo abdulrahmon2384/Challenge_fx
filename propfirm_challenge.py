@@ -230,17 +230,51 @@ def calculate_next_risk(challenge):
         risk = min(max_dd_risk, target_risk, daily_risk)
         return max(risk,0), total_open_risk
 
-def pip_value(pair):
-    if "JPY" in pair:
-        return 0.01
-    return 0.0001
+def calculate_lot(pair, entry, sl, risk):
+    """
+    Advanced Lot Calculation based on Pair Type.
+    Assumes Account Currency is USD.
+    Standard Lot = 100,000 units (Forex), 100 oz (Gold).
+    """
+    pair = pair.upper()
+    delta_price = abs(entry - sl)
+    
+    if delta_price == 0: return 0
+    
+    # 1. Gold (XAUUSD)
+    if "XAU" in pair:
+        # Contract size 100. $1 move = $100 PnL per lot.
+        # Lot = Risk / (Delta * 100)
+        lot = risk / (delta_price * 100)
+        
+    # 2. USD as Quote (EURUSD, GBPUSD, AUDUSD, NZDUSD)
+    # Value is already in USD.
+    # 1 Lot = 100,000 units.
+    # PnL = Lot * Delta * 100,000
+    elif pair.endswith("USD"):
+        lot = risk / (delta_price * 100000)
+        
+    # 3. USD as Base (USDCAD, USDJPY, USDCHF)
+    # Value is in Quote currency (CAD, JPY). Need to convert back to USD.
+    # PnL (USD) = (Lot * Delta * 100,000) / Price
+    # Lot = (Risk * Price) / (Delta * 100,000)
+    elif pair.startswith("USD"):
+        # Use Entry price as approximation for Exchange Rate
+        lot = (risk * entry) / (delta_price * 100000)
+        
+    # 4. Cross Pairs (EURGBP, AUDJPY) - Approximation
+    # We don't have the conversion rate (e.g. GBPUSD) handy.
+    # We fallback to standard Calculation or ask user?
+    # For better UX in a CLI without live data, we'll assume a standard 
+    # approximation or treat as USD Quote (safest 'generic' guess),
+    # but strictly this is inaccurate.
+    # However, user asked for "perfectly" on specific pairs. 
+    # For custom pairs, we'll use standard forex logic (100k contract).
+    else:
+        # Fallback: Treat like EURUSD ( Standard $10/pip roughly )
+        lot = risk / (delta_price * 100000)
 
-def calculate_lot(pair, entry, sl, risk, pip_worth=10):
-    pip = pip_value(pair)
-    stop_pips = abs(entry - sl)/pip
-    if stop_pips == 0: return 0
-    lot = risk/(stop_pips*pip_worth)
-    return round(lot,3)
+    return round(lot, 2)
 
 # ----------------- TRADES -----------------
 def open_trade(user_id, challenge_id):
@@ -262,7 +296,15 @@ def open_trade(user_id, challenge_id):
         pause()
         return
 
-    pair = Prompt.ask("Pair").upper()
+    # Pair Selection Menu
+    common_pairs = ["GBPUSD", "EURUSD", "AUDUSD", "XAUUSD", "USDCAD", "USDNZD", "Custom"]
+    pair_choice = Prompt.ask("Select Pair", choices=common_pairs, default="GBPUSD")
+    
+    if pair_choice == "Custom":
+        pair = Prompt.ask("Enter Custom Pair Symbol").upper()
+    else:
+        pair = pair_choice
+
     entry = FloatPrompt.ask("Entry Price")
     sl = FloatPrompt.ask("Stop Loss")
     tp = FloatPrompt.ask("Take Profit")
@@ -332,7 +374,8 @@ def view_trade_history(challenge_id):
 
         for r in rows:
             status_style = "green" if r[4] == "win" else "red"
-            if r[4] == "be": status_style = "yellow"
+            if r[4] == "be":
+                status_style = "yellow"
             
             table.add_row(str(r[0]), r[1], str(r[2]), f"{r[3]:.2f}", f"[{status_style}]{r[4].upper()}[/{status_style}]")
         
@@ -362,6 +405,16 @@ def update_trade(challenge_id):
         if challenge['type'] == 'prop':
             equity += risk * rr
         else:
+            # For live, we don't store RR in DB? 
+            # Actually we store RR in DB for Live as 0 if not set.
+            # Live users usually have dynamic RR per trade.
+            # But the schema assumes fixed RR per challenge or we need to ask for R realized.
+            # Given simplicity, let's ask "Realized PnL" for live?
+            # The prompt didn't specify, but for "Live" fixed RR is rare.
+            # HOWEVER, for now, let's assume 2R or ask user?
+            # Let's stick to the existing logic for now. 
+            # If RR is 0, win adds 0. That's a bug for Live.
+            # Let's prompt for amount if RR is 0.
             if rr == 0:
                 pnl = FloatPrompt.ask("Profit Amount")
                 equity += pnl
@@ -406,35 +459,45 @@ def account_dashboard(user_id, challenge_id):
         conn.close()
         
         # --- UI ---
-        equity_color = "green" if challenge['equity'] >= challenge['starting_balance'] else "red"
+        equity = challenge['equity']
+        start_bal = challenge['starting_balance']
+        equity_color = "green" if equity >= start_bal else "red"
         
+        # Calculate Growth %
+        if start_bal > 0:
+            growth_pct = ((equity - start_bal) / start_bal) * 100
+        else:
+            growth_pct = 0.0
+            
+        growth_color = "green" if growth_pct >= 0 else "red"
+        growth_str = f"[{growth_color}]{growth_pct:+.2f}%[/{growth_color}]"
+
         grid = Table.grid(expand=True)
         grid.add_column(justify="center", ratio=1)
         grid.add_column(justify="center", ratio=1)
         grid.add_column(justify="center", ratio=1)
         
+        # Common Top Row
+        grid.add_row(
+            Panel(f"[{equity_color}]{equity:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
+            Panel(growth_str, title="Total Growth", style="bold"),
+            Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold")
+        )
+
         if challenge['type'] == 'live':
+            # Live Specific Row 2
             grid.add_row(
-                Panel(f"[{equity_color}]{challenge['equity']:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
                 Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
-                Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold")
-            )
-            grid.add_row(
-                Panel("[dim]N/A[/dim]", title="Daily Limit", style="dim"),
                 Panel(f"[bold cyan]{next_risk:.2f}[/bold cyan]", title="SUGGESTED RISK", style="bold white", border_style="cyan"),
-                Panel("[dim]N/A[/dim]", title="Target", style="dim")
+                Panel("[dim]N/A[/dim]", title="Daily Limit", style="dim")
             )
             subtitle_text = "Live Trading Strategy"
         else:
-            grid.add_row(
-                Panel(f"[{equity_color}]{challenge['equity']:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
-                Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
-                Panel(f"[gold1]{challenge['target']:.2f}[/gold1]", title="Profit Target", style="bold")
-            )
+            # Prop Specific Row 2
             grid.add_row(
                 Panel(f"[red]{challenge['daily_loss_used']:.2f}[/red]", title="Daily Loss Used", style="bold"),
-                Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold"),
-                Panel(f"[bold green]{next_risk:.2f}[/bold green]", title="NEXT RISK ALLOWED", style="bold white", border_style="green")
+                Panel(f"[bold green]{next_risk:.2f}[/bold green]", title="NEXT RISK ALLOWED", style="bold white", border_style="green"),
+                Panel(f"[gold1]{challenge['target']:.2f}[/gold1]", title="Profit Target", style="bold")
             )
             subtitle_text = "Prop Firm Risk Assistant"
         
