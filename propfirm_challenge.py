@@ -42,9 +42,16 @@ def init_db():
         trailing_dd REAL,
         daily_dd REAL,
         rr REAL,
-        daily_loss_used REAL DEFAULT 0
+        daily_loss_used REAL DEFAULT 0,
+        type TEXT DEFAULT 'prop'
     )
     """)
+    # Migration for existing tables without 'type' column
+    try:
+        cur.execute("ALTER TABLE challenges ADD COLUMN type TEXT DEFAULT 'prop'")
+    except sqlite3.OperationalError:
+        pass # Column likely exists
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades(
         id INTEGER PRIMARY KEY,
@@ -93,32 +100,45 @@ def login_or_create_user():
 # ----------------- CHALLENGE -----------------
 def create_challenge(user_id):
     clear()
-    console.print(Panel("[bold]Create New Challenge[/bold]", style="cyan"))
+    console.print(Panel("[bold]Create New Account[/bold]", style="cyan"))
     
-    name = Prompt.ask("Challenge Name").strip()
+    ctype = Prompt.ask("Account Type", choices=["Prop Firm", "Live Trading"], default="Prop Firm")
+    name = Prompt.ask("Account Name").strip()
     start = FloatPrompt.ask("Starting Balance")
-    target = FloatPrompt.ask("Target %")
-    trailing = FloatPrompt.ask("Trailing Drawdown %")
-    daily = FloatPrompt.ask("Daily Drawdown %")
-    rr = FloatPrompt.ask("Reward Ratio (RR)")
+    
+    if ctype == "Prop Firm":
+        target_pct = FloatPrompt.ask("Target %")
+        trailing = FloatPrompt.ask("Trailing Drawdown %")
+        daily = FloatPrompt.ask("Daily Drawdown %")
+        rr = FloatPrompt.ask("Reward Ratio (RR)")
+        target_equity = start * (1 + target_pct/100)
+        c_type_val = 'prop'
+        trailing_val = trailing/100
+        daily_val = daily/100
+    else:
+        # Live Trading defaults
+        target_equity = 0
+        trailing_val = 0
+        daily_val = 0
+        rr = 0
+        c_type_val = 'live'
 
-    target_equity = start * (1 + target/100)
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
     cur.execute("""
-    INSERT INTO challenges(user_id,name,starting_balance,equity,highest,target,trailing_dd,daily_dd,rr)
-    VALUES(?,?,?,?,?,?,?,?,?)
-    """, (user_id,name,start,start,start,target_equity,trailing/100,daily/100,rr))
+    INSERT INTO challenges(user_id,name,starting_balance,equity,highest,target,trailing_dd,daily_dd,rr,type)
+    VALUES(?,?,?,?,?,?,?,?,?,?)
+    """, (user_id,name,start,start,start,target_equity,trailing_val,daily_val,rr,c_type_val))
     conn.commit()
     conn.close()
-    console.print("\n[bold green]Challenge created successfully![/bold green]")
+    console.print("\n[bold green]Account created successfully![/bold green]")
     pause()
     
     
 def list_challenges(user_id):
     conn = sqlite3.connect(DB)
     cur = conn.cursor()
-    cur.execute("SELECT id,name,equity,target,daily_loss_used,highest,trailing_dd,daily_dd,rr,starting_balance FROM challenges WHERE user_id=?", (user_id,))
+    cur.execute("SELECT id,name,equity,target,daily_loss_used,highest,trailing_dd,daily_dd,rr,starting_balance,type FROM challenges WHERE user_id=?", (user_id,))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -126,24 +146,25 @@ def list_challenges(user_id):
 def select_challenge(user_id):
     challenges = list_challenges(user_id)
     if not challenges:
-        console.print("[yellow]No challenges found. Create one first.[/yellow]")
+        console.print("[yellow]No accounts found. Create one first.[/yellow]")
         pause()
         return None
     clear()
     
-    table = Table(title="Your Challenges", box=box.SIMPLE)
+    table = Table(title="Your Accounts", box=box.SIMPLE)
     table.add_column("ID", justify="center", style="cyan", no_wrap=True)
     table.add_column("Name", style="magenta")
+    table.add_column("Type", style="yellow")
     table.add_column("Equity", justify="right", style="green")
-    table.add_column("Target", justify="right", style="blue")
     
     for c in challenges:
-        table.add_row(str(c[0]), c[1], f"{c[2]:.2f}", f"{c[3]:.2f}")
+        c_type = c[10] if len(c) > 10 else 'prop'
+        table.add_row(str(c[0]), c[1], c_type.upper(), f"{c[2]:.2f}")
         
     console.print(table)
     console.print("\n[dim]Enter 'B' to go back[/dim]")
     
-    choice = Prompt.ask("Select Challenge ID").strip()
+    choice = Prompt.ask("Select ID").strip()
     if choice.lower() == 'b':
         return None
     if choice.isdigit():
@@ -162,11 +183,14 @@ def load_challenge_data(challenge_id):
     row = cur.fetchone()
     conn.close()
     if not row: return None
+    
+    c_type = row[11] if len(row) > 11 else 'prop'
+    
     return {
         'id': row[0],'user_id': row[1],'name': row[2],
         'starting_balance': row[3],'equity': row[4],'highest': row[5],
         'target': row[6],'trailing_dd': row[7],'daily_dd': row[8],
-        'rr': row[9],'daily_loss_used': row[10]
+        'rr': row[9],'daily_loss_used': row[10], 'type': c_type
     }
 
 # ----------------- RISK & LOT -----------------
@@ -178,21 +202,33 @@ def calculate_next_risk(challenge):
     conn.close()
     
     equity = challenge['equity']
-    highest = challenge['highest']
-    target = challenge['target']
-    trailing = challenge['trailing_dd']
-    daily_limit = challenge['daily_dd']
-    daily_used = challenge['daily_loss_used']
-    rr = challenge['rr']
     
-    floor = highest * (1 - trailing)
-    max_dd_risk = equity - floor
-    target_risk = (target - equity)/rr
-    daily_allowance = daily_limit * challenge['starting_balance']
-    daily_risk = daily_allowance - daily_used - total_open_risk
-    
-    risk = min(max_dd_risk, target_risk, daily_risk)
-    return max(risk,0), total_open_risk
+    if challenge['type'] == 'live':
+        if equity < 10:
+            risk = equity * 0.02
+        elif equity < 110:
+            risk = 5.0
+        else:
+            steps = int(equity / 110)
+            risk = 10 * (2 ** (steps - 1))
+        return max(risk, 0), total_open_risk
+
+    else:
+        highest = challenge['highest']
+        target = challenge['target']
+        trailing = challenge['trailing_dd']
+        daily_limit = challenge['daily_dd']
+        daily_used = challenge['daily_loss_used']
+        rr = challenge['rr']
+        
+        floor = highest * (1 - trailing)
+        max_dd_risk = equity - floor
+        target_risk = (target - equity)/rr
+        daily_allowance = daily_limit * challenge['starting_balance']
+        daily_risk = daily_allowance - daily_used - total_open_risk
+        
+        risk = min(max_dd_risk, target_risk, daily_risk)
+        return max(risk,0), total_open_risk
 
 def pip_value(pair):
     if "JPY" in pair:
@@ -213,10 +249,16 @@ def open_trade(user_id, challenge_id):
     
     clear()
     console.print(Panel(f"[bold]Open Trade for '{challenge['name']}'[/bold]", style="blue"))
-    console.print(f"Next Risk Allowed: [bold green]{risk:.2f}[/bold green]")
+    
+    label = "Suggested Risk" if challenge['type'] == 'live' else "Next Risk Allowed"
+    console.print(f"{label}: [bold green]{risk:.2f}[/bold green]")
     
     if risk <= 0:
-        console.print(Panel("\n[bold red]No available risk for a new trade.[/bold red]\n[yellow]Your daily limit is either reached or fully committed to other open trades.[/yellow]", style="red"))
+        if challenge['type'] == 'prop':
+            msg = "Your daily limit is either reached or fully committed to other open trades."
+        else:
+            msg = "Insufficient balance to calculate a valid risk amount."
+        console.print(Panel(f"\n[bold red]No available risk for a new trade.[/bold red]\n[yellow]{msg}[/yellow]", style="red"))
         pause()
         return
 
@@ -254,7 +296,7 @@ def list_open_trades(challenge_id):
     if not rows:
         console.print(Panel("[yellow]No open trades.[/yellow]", title=f"Trades for Challenge ID {challenge_id}"))
     else:
-        table = Table(title=f"Open Trades - Challenge {challenge_id}", box=box.ROUNDED)
+        table = Table(title=f"Open Trades - ID {challenge_id}", box=box.ROUNDED)
         table.add_column("ID", style="cyan", justify="center")
         table.add_column("Pair", style="bold white")
         table.add_column("Entry", justify="right")
@@ -262,10 +304,37 @@ def list_open_trades(challenge_id):
         table.add_column("TP", justify="right", style="green")
         table.add_column("Lot", justify="center")
         table.add_column("Risk", justify="right", style="bold red")
-        table.add_column("Status", justify="center")
 
         for r in rows:
-            table.add_row(str(r[0]), r[1], str(r[2]), str(r[3]), str(r[4]), str(r[5]), f"{r[6]:.2f}", r[7])
+            table.add_row(str(r[0]), r[1], str(r[2]), str(r[3]), str(r[4]), str(r[5]), f"{r[6]:.2f}")
+        
+        console.print(table)
+    pause()
+
+def view_trade_history(challenge_id):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    # Select closed trades (status != 'open')
+    cur.execute("SELECT id,pair,lot,risk,status FROM trades WHERE challenge_id=? AND status!='open' ORDER BY id DESC", (challenge_id,))
+    rows = cur.fetchall()
+    conn.close()
+    
+    clear()
+    if not rows:
+        console.print(Panel("[yellow]No closed trades found.[/yellow]", title=f"History for Challenge ID {challenge_id}"))
+    else:
+        table = Table(title=f"Trade History - ID {challenge_id}", box=box.SIMPLE)
+        table.add_column("ID", style="dim", justify="center")
+        table.add_column("Pair", style="bold white")
+        table.add_column("Lot", justify="center")
+        table.add_column("Risk", justify="right")
+        table.add_column("Result", justify="center")
+
+        for r in rows:
+            status_style = "green" if r[4] == "win" else "red"
+            if r[4] == "be": status_style = "yellow"
+            
+            table.add_row(str(r[0]), r[1], str(r[2]), f"{r[3]:.2f}", f"[{status_style}]{r[4].upper()}[/{status_style}]")
         
         console.print(table)
     pause()
@@ -290,16 +359,15 @@ def update_trade(challenge_id):
     rr = challenge['rr']
     
     if status=="win":
-        equity += risk*rr
-        # Logic update: Daily loss used resets only on new day usually, but per previous logic, 
-        # a win might offset losses. However, strictly speaking, daily loss is usually "closed loss + open floating loss". 
-        # For this simple model, we follow the previous logic: if we win, we might not reduce 'daily_used' unless it recovers the loss.
-        # But the previous code set daily_used = 0 on win. I'll stick to that simple logic or improve it?
-        # The user wants "advanced". Real prop firms don't reset daily loss on a win; daily loss is a limit on how much you can LOSE in a day.
-        # But let's stick to the previous simple logic to avoid changing core behavior too much unless requested.
-        # Previous logic:
-        # if status=="win": daily_used = 0 
-        # This is very generous. Let's keep it for now.
+        if challenge['type'] == 'prop':
+            equity += risk * rr
+        else:
+            if rr == 0:
+                pnl = FloatPrompt.ask("Profit Amount")
+                equity += pnl
+            else:
+                equity += risk * rr
+        
         daily_used = 0 
     elif status=="loss":
         equity -= risk
@@ -319,23 +387,16 @@ def update_trade(challenge_id):
     console.print(f"[green]Trade updated to {status.upper()}[/green]")
     pause()
 
-# ----------------- DASHBOARD -----------------
-def dashboard(user_id, username):
+# ----------------- MENUS -----------------
+def account_dashboard(user_id, challenge_id):
     while True:
         clear()
-        challenges = list_challenges(user_id)
-        if not challenges:
-            console.print(Panel("No challenges created.\n\n1. Create Challenge\n2. Logout", title="Welcome", style="red"))
-            choice = Prompt.ask("Select")
-            if choice=="1":
-                create_challenge(user_id)
-            elif choice=="2":
-                return
-            continue
-            
-        # Pick first challenge (or selected one logic could be added)
-        # For simplicity, we stick to logic: load first challenge found.
-        challenge = load_challenge_data(challenges[0][0])
+        challenge = load_challenge_data(challenge_id)
+        if not challenge:
+            console.print("[red]Error loading account data.[/red]")
+            pause()
+            return
+
         next_risk, open_risk = calculate_next_risk(challenge)
         
         conn = sqlite3.connect(DB)
@@ -344,71 +405,101 @@ def dashboard(user_id, username):
         open_trades_count = cur.fetchone()[0]
         conn.close()
         
-        # --- Advanced Dashboard UI ---
-        
-        # Colors based on status
+        # --- UI ---
         equity_color = "green" if challenge['equity'] >= challenge['starting_balance'] else "red"
         
-        # Metrics Table
         grid = Table.grid(expand=True)
         grid.add_column(justify="center", ratio=1)
         grid.add_column(justify="center", ratio=1)
         grid.add_column(justify="center", ratio=1)
         
-        grid.add_row(
-            Panel(f"[{equity_color}]{challenge['equity']:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
-            Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
-            Panel(f"[gold1]{challenge['target']:.2f}[/gold1]", title="Profit Target", style="bold")
-        )
-        grid.add_row(
-            Panel(f"[red]{challenge['daily_loss_used']:.2f}[/red]", title="Daily Loss Used", style="bold"),
-            Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold"),
-            Panel(f"[bold green]{next_risk:.2f}[/bold green]", title="NEXT RISK ALLOWED", style="bold white", border_style="green")
-        )
+        if challenge['type'] == 'live':
+            grid.add_row(
+                Panel(f"[{equity_color}]{challenge['equity']:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
+                Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
+                Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold")
+            )
+            grid.add_row(
+                Panel("[dim]N/A[/dim]", title="Daily Limit", style="dim"),
+                Panel(f"[bold cyan]{next_risk:.2f}[/bold cyan]", title="SUGGESTED RISK", style="bold white", border_style="cyan"),
+                Panel("[dim]N/A[/dim]", title="Target", style="dim")
+            )
+            subtitle_text = "Live Trading Strategy"
+        else:
+            grid.add_row(
+                Panel(f"[{equity_color}]{challenge['equity']:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
+                Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
+                Panel(f"[gold1]{challenge['target']:.2f}[/gold1]", title="Profit Target", style="bold")
+            )
+            grid.add_row(
+                Panel(f"[red]{challenge['daily_loss_used']:.2f}[/red]", title="Daily Loss Used", style="bold"),
+                Panel(f"[magenta]{open_trades_count}[/magenta]", title="Open Trades", style="bold"),
+                Panel(f"[bold green]{next_risk:.2f}[/bold green]", title="NEXT RISK ALLOWED", style="bold white", border_style="green")
+            )
+            subtitle_text = "Prop Firm Risk Assistant"
         
-        # Main Layout
         main_panel = Panel(
             Align.center(grid),
-            title=f"[bold cyan]User: {username} | Challenge: {challenge['name']}[/bold cyan]",
-            subtitle="[dim]Prop Firm Risk Assistant[/dim]",
+            title=f"[bold cyan]Account: {challenge['name']} ({challenge['type'].upper()})[/bold cyan]",
+            subtitle=f"[dim]{subtitle_text}[/dim]",
             box=box.HEAVY,
             padding=(1, 2)
         )
-        
         console.print(main_panel)
         
-        # Menu
+        # Internal Menu
         console.print(Panel(
-            "[1] Create Challenge    [2] Select Challenge    [3] Open Trade\n"
-            "[4] List Open Trades    [5] Update Trade Result [6] Logout",
-            title="Actions",
+            "[1] Open Trade          [2] List Open Trades\n"
+            "[3] Trade History       [4] Update Trade Result\n"
+            "[5] Back to Main Menu",
+            title="Account Actions",
             border_style="blue",
             box=box.ROUNDED
         ))
         
-        choice = Prompt.ask("Select Option").strip()
+        choice = Prompt.ask("Select Option", choices=["1", "2", "3", "4", "5"])
         
         if choice=="1":
-            create_challenge(user_id)
-        elif choice=="2":
-            select_challenge(user_id)
-        elif choice=="3":
             open_trade(user_id, challenge['id'])
-        elif choice=="4":
+        elif choice=="2":
             list_open_trades(challenge['id'])
-        elif choice=="5":
+        elif choice=="3":
+            view_trade_history(challenge['id'])
+        elif choice=="4":
             update_trade(challenge['id'])
-        elif choice=="6":
+        elif choice=="5":
             return
-        else:
-            console.print("[red]Invalid choice[/red]")
-            pause()
+
+def main_menu(user_id, username):
+    while True:
+        clear()
+        console.print(Panel(
+            Align.center(f"[bold]Welcome, {username}![/bold]\nSelect an option to manage your trading accounts."),
+            title="Main Menu",
+            box=box.DOUBLE,
+            style="magenta"
+        ))
+        
+        console.print("[1] Add Account")
+        console.print("[2] Select Existing Account")
+        console.print("[3] Logout")
+        
+        choice = Prompt.ask("\nSelect Option", choices=["1", "2", "3"])
+        
+        if choice == "1":
+            create_challenge(user_id)
+        elif choice == "2":
+            cid = select_challenge(user_id)
+            if cid:
+                account_dashboard(user_id, cid)
+        elif choice == "3":
+            return
 
 # ----------------- MAIN -----------------
 def main():
     init_db()
     user_id, username = login_or_create_user()
-    dashboard(user_id, username)
+    main_menu(user_id, username)
 
 if __name__=="__main__":
     main()
