@@ -1,6 +1,7 @@
 import os
 import sys
-import psycopg2
+import mysql.connector
+from urllib.parse import urlparse
 from dotenv import load_dotenv
 
 # Try to import rich
@@ -19,43 +20,55 @@ except ImportError:
 # Load environment variables
 load_dotenv()
 
+console = Console()
+
 # Database Connection Helper
 def get_db_connection():
+    db_url = os.getenv("DATABASE_URL")
+    if not db_url:
+        console.print("[bold red]Error:[/bold red] DATABASE_URL not found in .env file.")
+        sys.exit(1)
+        
     try:
-        conn = psycopg2.connect(
-            host=os.getenv("DB_HOST"),
-            database=os.getenv("DB_NAME"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            port=os.getenv("DB_PORT", 5432)
+        # Parse the URL manually
+        # Expected format: mysql://user:password@host:port/database
+        # Or standard SQLAlchemy format
+        url = urlparse(db_url)
+        
+        # Extract components
+        # Note: url.path returns '/database', so we slice [1:]
+        conn = mysql.connector.connect(
+            user=url.username,
+            password=url.password,
+            host=url.hostname,
+            port=url.port if url.port else 3306,
+            database=url.path[1:]
         )
         return conn
     except Exception as e:
         console.print(f"[bold red]Error connecting to database:[/bold red] {e}")
-        console.print("[yellow]Ensure your .env file is set up correctly with filess.io credentials.[/yellow]")
+        console.print(f"[yellow]Ensure your DATABASE_URL is correct: {db_url}[/yellow]")
         sys.exit(1)
-
-console = Console()
 
 # ----------------- UTILS -----------------
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Users Table
+    # Users Table (MySQL Syntax: AUTO_INCREMENT instead of SERIAL)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(255) UNIQUE
     );
     """)
     
     # Challenges Table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS challenges (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        name TEXT,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT,
+        name VARCHAR(255),
         starting_balance REAL,
         equity REAL,
         highest REAL,
@@ -64,22 +77,22 @@ def init_db():
         daily_dd REAL,
         rr REAL,
         daily_loss_used REAL DEFAULT 0,
-        type TEXT DEFAULT 'prop'
+        type VARCHAR(50) DEFAULT 'prop'
     );
     """)
     
     # Trades Table
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
-        id SERIAL PRIMARY KEY,
-        challenge_id INTEGER,
-        pair TEXT,
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        challenge_id INT,
+        pair VARCHAR(50),
         entry REAL,
         sl REAL,
         tp REAL,
         lot REAL,
         risk REAL,
-        status TEXT
+        status VARCHAR(50)
     );
     """)
     
@@ -102,6 +115,7 @@ def login_or_create_user():
     
     conn = get_db_connection()
     cur = conn.cursor()
+    # MySQL uses %s for placeholders
     cur.execute("SELECT id FROM users WHERE username=%s", (username,))
     row = cur.fetchone()
     
@@ -109,8 +123,9 @@ def login_or_create_user():
         user_id = row[0]
         console.print(f"\n[bold green]Welcome back, {username}![/bold green]")
     else:
-        cur.execute("INSERT INTO users(username) VALUES(%s) RETURNING id", (username,))
-        user_id = cur.fetchone()[0]
+        # MySQL: No RETURNING id
+        cur.execute("INSERT INTO users(username) VALUES(%s)", (username,))
+        user_id = cur.lastrowid
         conn.commit()
         console.print(f"\n[bold green]User '{username}' created![/bold green]")
     
@@ -220,9 +235,10 @@ def load_challenge_data(challenge_id):
 def calculate_next_risk(challenge):
     conn = get_db_connection()
     cur = conn.cursor()
+    # Handle NULL sum result (MySQL returns None if no rows match)
     cur.execute("SELECT SUM(risk) FROM trades WHERE challenge_id=%s AND status='open'", (challenge['id'],))
     result = cur.fetchone()
-    total_open_risk = result[0] if result and result[0] else 0
+    total_open_risk = float(result[0]) if result and result[0] is not None else 0.0
     cur.close()
     conn.close()
     
