@@ -1,38 +1,59 @@
-import sqlite3
 import os
 import sys
+import psycopg2
+from dotenv import load_dotenv
 
-# Try to import rich, if not installed, give instructions
+# Try to import rich
 try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
     from rich.prompt import Prompt, FloatPrompt, IntPrompt
-    from rich.layout import Layout
     from rich.align import Align
-    from rich.text import Text
     from rich import box
 except ImportError:
-    print("Error: 'rich' library is required for the advanced terminal view.")
+    print("Error: 'rich' library is required.")
     print("Please run: pip install -r requirements.txt")
     sys.exit(1)
 
-DB = "challenge_terminal.db"
+# Load environment variables
+load_dotenv()
+
+# Database Connection Helper
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST"),
+            database=os.getenv("DB_NAME"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            port=os.getenv("DB_PORT", 5432)
+        )
+        return conn
+    except Exception as e:
+        console.print(f"[bold red]Error connecting to database:[/bold red] {e}")
+        console.print("[yellow]Ensure your .env file is set up correctly with filess.io credentials.[/yellow]")
+        sys.exit(1)
+
 console = Console()
 
 # ----------------- UTILS -----------------
 def init_db():
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
+    
+    # Users Table
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
         username TEXT UNIQUE
-    )
+    );
     """)
+    
+    # Challenges Table
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS challenges(
-        id INTEGER PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS challenges (
+        id SERIAL PRIMARY KEY,
         user_id INTEGER,
         name TEXT,
         starting_balance REAL,
@@ -44,17 +65,13 @@ def init_db():
         rr REAL,
         daily_loss_used REAL DEFAULT 0,
         type TEXT DEFAULT 'prop'
-    )
+    );
     """)
-    # Migration for existing tables without 'type' column
-    try:
-        cur.execute("ALTER TABLE challenges ADD COLUMN type TEXT DEFAULT 'prop'")
-    except sqlite3.OperationalError:
-        pass # Column likely exists
-
+    
+    # Trades Table
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS trades(
-        id INTEGER PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS trades (
+        id SERIAL PRIMARY KEY,
         challenge_id INTEGER,
         pair TEXT,
         entry REAL,
@@ -63,9 +80,11 @@ def init_db():
         lot REAL,
         risk REAL,
         status TEXT
-    )
+    );
     """)
+    
     conn.commit()
+    cur.close()
     conn.close()
 
 def clear():
@@ -81,18 +100,21 @@ def login_or_create_user():
     
     username = Prompt.ask("[bold green]Enter your username[/bold green] (or new one to create)").strip()
     
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE username=?", (username,))
+    cur.execute("SELECT id FROM users WHERE username=%s", (username,))
     row = cur.fetchone()
+    
     if row:
         user_id = row[0]
         console.print(f"\n[bold green]Welcome back, {username}![/bold green]")
     else:
-        cur.execute("INSERT INTO users(username) VALUES(?)", (username,))
+        cur.execute("INSERT INTO users(username) VALUES(%s) RETURNING id", (username,))
+        user_id = cur.fetchone()[0]
         conn.commit()
-        user_id = cur.lastrowid
         console.print(f"\n[bold green]User '{username}' created![/bold green]")
+    
+    cur.close()
     conn.close()
     pause()
     return user_id, username
@@ -116,30 +138,30 @@ def create_challenge(user_id):
         trailing_val = trailing/100
         daily_val = daily/100
     else:
-        # Live Trading defaults
         target_equity = 0
         trailing_val = 0
         daily_val = 0
         rr = 0
         c_type_val = 'live'
 
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO challenges(user_id,name,starting_balance,equity,highest,target,trailing_dd,daily_dd,rr,type)
-    VALUES(?,?,?,?,?,?,?,?,?,?)
+    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (user_id,name,start,start,start,target_equity,trailing_val,daily_val,rr,c_type_val))
     conn.commit()
+    cur.close()
     conn.close()
     console.print("\n[bold green]Account created successfully![/bold green]")
     pause()
     
-    
 def list_challenges(user_id):
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id,name,equity,target,daily_loss_used,highest,trailing_dd,daily_dd,rr,starting_balance,type FROM challenges WHERE user_id=?", (user_id,))
+    cur.execute("SELECT id,name,equity,target,daily_loss_used,highest,trailing_dd,daily_dd,rr,starting_balance,type FROM challenges WHERE user_id=%s", (user_id,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     return rows
 
@@ -177,10 +199,11 @@ def select_challenge(user_id):
     return None
 
 def load_challenge_data(challenge_id):
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM challenges WHERE id=?", (challenge_id,))
+    cur.execute("SELECT * FROM challenges WHERE id=%s", (challenge_id,))
     row = cur.fetchone()
+    cur.close()
     conn.close()
     if not row: return None
     
@@ -195,10 +218,12 @@ def load_challenge_data(challenge_id):
 
 # ----------------- RISK & LOT -----------------
 def calculate_next_risk(challenge):
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT SUM(risk) FROM trades WHERE challenge_id=? AND status='open'", (challenge['id'],))
-    total_open_risk = cur.fetchone()[0] or 0
+    cur.execute("SELECT SUM(risk) FROM trades WHERE challenge_id=%s AND status='open'", (challenge['id'],))
+    result = cur.fetchone()
+    total_open_risk = result[0] if result and result[0] else 0
+    cur.close()
     conn.close()
     
     equity = challenge['equity']
@@ -231,47 +256,18 @@ def calculate_next_risk(challenge):
         return max(risk,0), total_open_risk
 
 def calculate_lot(pair, entry, sl, risk):
-    """
-    Advanced Lot Calculation based on Pair Type.
-    Assumes Account Currency is USD.
-    Standard Lot = 100,000 units (Forex), 100 oz (Gold).
-    """
     pair = pair.upper()
     delta_price = abs(entry - sl)
     
     if delta_price == 0: return 0
     
-    # 1. Gold (XAUUSD)
     if "XAU" in pair:
-        # Contract size 100. $1 move = $100 PnL per lot.
-        # Lot = Risk / (Delta * 100)
         lot = risk / (delta_price * 100)
-        
-    # 2. USD as Quote (EURUSD, GBPUSD, AUDUSD, NZDUSD)
-    # Value is already in USD.
-    # 1 Lot = 100,000 units.
-    # PnL = Lot * Delta * 100,000
     elif pair.endswith("USD"):
         lot = risk / (delta_price * 100000)
-        
-    # 3. USD as Base (USDCAD, USDJPY, USDCHF)
-    # Value is in Quote currency (CAD, JPY). Need to convert back to USD.
-    # PnL (USD) = (Lot * Delta * 100,000) / Price
-    # Lot = (Risk * Price) / (Delta * 100,000)
     elif pair.startswith("USD"):
-        # Use Entry price as approximation for Exchange Rate
         lot = (risk * entry) / (delta_price * 100000)
-        
-    # 4. Cross Pairs (EURGBP, AUDJPY) - Approximation
-    # We don't have the conversion rate (e.g. GBPUSD) handy.
-    # We fallback to standard Calculation or ask user?
-    # For better UX in a CLI without live data, we'll assume a standard 
-    # approximation or treat as USD Quote (safest 'generic' guess),
-    # but strictly this is inaccurate.
-    # However, user asked for "perfectly" on specific pairs. 
-    # For custom pairs, we'll use standard forex logic (100k contract).
     else:
-        # Fallback: Treat like EURUSD ( Standard $10/pip roughly )
         lot = risk / (delta_price * 100000)
 
     return round(lot, 2)
@@ -288,22 +284,14 @@ def open_trade(user_id, challenge_id):
     console.print(f"{label}: [bold green]{risk:.2f}[/bold green]")
     
     if risk <= 0:
-        if challenge['type'] == 'prop':
-            msg = "Your daily limit is either reached or fully committed to other open trades."
-        else:
-            msg = "Insufficient balance to calculate a valid risk amount."
-        console.print(Panel(f"\n[bold red]No available risk for a new trade.[/bold red]\n[yellow]{msg}[/yellow]", style="red"))
+        msg = "Your daily limit is reached." if challenge['type'] == 'prop' else "Insufficient balance."
+        console.print(Panel(f"\n[bold red]No available risk.[/bold red]\n[yellow]{msg}[/yellow]", style="red"))
         pause()
         return
 
-    # Pair Selection Menu
     common_pairs = ["GBPUSD", "EURUSD", "AUDUSD", "XAUUSD", "USDCAD", "USDNZD", "Custom"]
     pair_choice = Prompt.ask("Select Pair", choices=common_pairs, default="GBPUSD")
-    
-    if pair_choice == "Custom":
-        pair = Prompt.ask("Enter Custom Pair Symbol").upper()
-    else:
-        pair = pair_choice
+    pair = Prompt.ask("Enter Custom Pair Symbol").upper() if pair_choice == "Custom" else pair_choice
 
     entry = FloatPrompt.ask("Entry Price")
     sl = FloatPrompt.ask("Stop Loss")
@@ -314,13 +302,14 @@ def open_trade(user_id, challenge_id):
     console.print(Panel(f"Suggested Lot: [bold cyan]{lot}[/bold cyan] | Risk: [bold red]{risk:.2f}[/bold red]", style="white"))
     
     if Prompt.ask("Confirm Trade?", choices=["y", "n"], default="y") == "y":
-        conn = sqlite3.connect(DB)
+        conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
         INSERT INTO trades(challenge_id,pair,entry,sl,tp,lot,risk,status)
-        VALUES(?,?,?,?,?,?,?,?)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s)
         """,(challenge_id,pair,entry,sl,tp,lot,risk,"open"))
         conn.commit()
+        cur.close()
         conn.close()
         console.print("[green]Trade Opened![/green]")
     else:
@@ -328,10 +317,11 @@ def open_trade(user_id, challenge_id):
     pause()
 
 def list_open_trades(challenge_id):
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id,pair,entry,sl,tp,lot,risk,status FROM trades WHERE challenge_id=? AND status='open'", (challenge_id,))
+    cur.execute("SELECT id,pair,entry,sl,tp,lot,risk,status FROM trades WHERE challenge_id=%s AND status='open'", (challenge_id,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     
     clear()
@@ -354,11 +344,11 @@ def list_open_trades(challenge_id):
     pause()
 
 def view_trade_history(challenge_id):
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    # Select closed trades (status != 'open')
-    cur.execute("SELECT id,pair,lot,risk,status FROM trades WHERE challenge_id=? AND status!='open' ORDER BY id DESC", (challenge_id,))
+    cur.execute("SELECT id,pair,lot,risk,status FROM trades WHERE challenge_id=%s AND status!='open' ORDER BY id DESC", (challenge_id,))
     rows = cur.fetchall()
+    cur.close()
     conn.close()
     
     clear()
@@ -374,9 +364,7 @@ def view_trade_history(challenge_id):
 
         for r in rows:
             status_style = "green" if r[4] == "win" else "red"
-            if r[4] == "be":
-                status_style = "yellow"
-            
+            if r[4] == "be": status_style = "yellow"
             table.add_row(str(r[0]), r[1], str(r[2]), f"{r[3]:.2f}", f"[{status_style}]{r[4].upper()}[/{status_style}]")
         
         console.print(table)
@@ -386,15 +374,18 @@ def update_trade(challenge_id):
     trade_id = IntPrompt.ask("Trade ID to update")
     status = Prompt.ask("Status", choices=["win", "loss", "be"], default="win")
     
-    conn = sqlite3.connect(DB)
+    conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT risk FROM trades WHERE id=? AND challenge_id=?", (trade_id,challenge_id))
+    cur.execute("SELECT risk FROM trades WHERE id=%s AND challenge_id=%s", (trade_id,challenge_id))
     row = cur.fetchone()
+    
     if not row:
         console.print("[red]Trade not found[/red]")
+        cur.close()
         conn.close()
         pause()
         return
+        
     risk = row[0]
     challenge = load_challenge_data(challenge_id)
     equity = challenge['equity']
@@ -405,22 +396,11 @@ def update_trade(challenge_id):
         if challenge['type'] == 'prop':
             equity += risk * rr
         else:
-            # For live, we don't store RR in DB? 
-            # Actually we store RR in DB for Live as 0 if not set.
-            # Live users usually have dynamic RR per trade.
-            # But the schema assumes fixed RR per challenge or we need to ask for R realized.
-            # Given simplicity, let's ask "Realized PnL" for live?
-            # The prompt didn't specify, but for "Live" fixed RR is rare.
-            # HOWEVER, for now, let's assume 2R or ask user?
-            # Let's stick to the existing logic for now. 
-            # If RR is 0, win adds 0. That's a bug for Live.
-            # Let's prompt for amount if RR is 0.
             if rr == 0:
                 pnl = FloatPrompt.ask("Profit Amount")
                 equity += pnl
             else:
                 equity += risk * rr
-        
         daily_used = 0 
     elif status=="loss":
         equity -= risk
@@ -428,19 +408,16 @@ def update_trade(challenge_id):
     elif status=="be":
         pass
         
-    if equity > challenge['highest']:
-        highest = equity
-    else:
-        highest = challenge['highest']
+    highest = max(equity, challenge['highest'])
         
-    cur.execute("UPDATE challenges SET equity=?, highest=?, daily_loss_used=? WHERE id=?", (equity,highest,daily_used,challenge_id))
-    cur.execute("UPDATE trades SET status=? WHERE id=?", (status,trade_id))
+    cur.execute("UPDATE challenges SET equity=%s, highest=%s, daily_loss_used=%s WHERE id=%s", (equity,highest,daily_used,challenge_id))
+    cur.execute("UPDATE trades SET status=%s WHERE id=%s", (status,trade_id))
     conn.commit()
+    cur.close()
     conn.close()
     console.print(f"[green]Trade updated to {status.upper()}[/green]")
     pause()
 
-# ----------------- MENUS -----------------
 def account_dashboard(user_id, challenge_id):
     while True:
         clear()
@@ -452,23 +429,18 @@ def account_dashboard(user_id, challenge_id):
 
         next_risk, open_risk = calculate_next_risk(challenge)
         
-        conn = sqlite3.connect(DB)
+        conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM trades WHERE challenge_id=? AND status='open'", (challenge['id'],))
+        cur.execute("SELECT COUNT(*) FROM trades WHERE challenge_id=%s AND status='open'", (challenge['id'],))
         open_trades_count = cur.fetchone()[0]
+        cur.close()
         conn.close()
         
-        # --- UI ---
         equity = challenge['equity']
         start_bal = challenge['starting_balance']
         equity_color = "green" if equity >= start_bal else "red"
         
-        # Calculate Growth %
-        if start_bal > 0:
-            growth_pct = ((equity - start_bal) / start_bal) * 100
-        else:
-            growth_pct = 0.0
-            
+        growth_pct = ((equity - start_bal) / start_bal) * 100 if start_bal > 0 else 0.0
         growth_color = "green" if growth_pct >= 0 else "red"
         growth_str = f"[{growth_color}]{growth_pct:+.2f}%[/{growth_color}]"
 
@@ -477,7 +449,6 @@ def account_dashboard(user_id, challenge_id):
         grid.add_column(justify="center", ratio=1)
         grid.add_column(justify="center", ratio=1)
         
-        # Common Top Row
         grid.add_row(
             Panel(f"[{equity_color}]{equity:.2f}[/{equity_color}]", title="Current Equity", style="bold"),
             Panel(growth_str, title="Total Growth", style="bold"),
@@ -485,7 +456,6 @@ def account_dashboard(user_id, challenge_id):
         )
 
         if challenge['type'] == 'live':
-            # Live Specific Row 2
             grid.add_row(
                 Panel(f"[blue]{challenge['highest']:.2f}[/blue]", title="High Watermark", style="bold"),
                 Panel(f"[bold cyan]{next_risk:.2f}[/bold cyan]", title="SUGGESTED RISK", style="bold white", border_style="cyan"),
@@ -493,7 +463,6 @@ def account_dashboard(user_id, challenge_id):
             )
             subtitle_text = "Live Trading Strategy"
         else:
-            # Prop Specific Row 2
             grid.add_row(
                 Panel(f"[red]{challenge['daily_loss_used']:.2f}[/red]", title="Daily Loss Used", style="bold"),
                 Panel(f"[bold green]{next_risk:.2f}[/bold green]", title="NEXT RISK ALLOWED", style="bold white", border_style="green"),
@@ -510,7 +479,6 @@ def account_dashboard(user_id, challenge_id):
         )
         console.print(main_panel)
         
-        # Internal Menu
         console.print(Panel(
             "[1] Open Trade          [2] List Open Trades\n"
             "[3] Trade History       [4] Update Trade Result\n"
@@ -558,7 +526,6 @@ def main_menu(user_id, username):
         elif choice == "3":
             return
 
-# ----------------- MAIN -----------------
 def main():
     init_db()
     user_id, username = login_or_create_user()
